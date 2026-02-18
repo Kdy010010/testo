@@ -1,9 +1,24 @@
-/*
- * OS/2026 Web Emulator — Mobile-Friendly Edition
- * VGA 80×25 faithful emulation + IndexedDB FS
- * Mobile: real textarea input + virtual CLI keyboard + D-pad
- */
-import { useState, useEffect, useRef, useCallback } from "react";
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<title>OS/2026 NEON</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body,#root{width:100%;height:100%;background:#000;overflow:hidden;}
+body{-webkit-tap-highlight-color:transparent;touch-action:pan-x pan-y;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script type="text/babel" data-presets="react">
+const {useState,useEffect,useRef,useCallback}=React;
 
 // ─── IndexedDB FS ───────────────────────────────────────
 const DB_NAME="OS2026_FS",DB_VER=1,STORE="fs";
@@ -301,7 +316,7 @@ Mouse: PS/2 (GUI only).
 `.split('\n');
 
 // ─── App ─────────────────────────────────────────────────
-export default function App(){
+function App(){
   const [fs,setFs]=useState(null);
   const [phase,setPhase]=useState("boot");
   const [cliLines,setCliLines]=useState([]);
@@ -898,3 +913,8 @@ export default function App(){
     </div>
   );
 }
+const root=ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
