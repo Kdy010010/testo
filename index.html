@@ -1,0 +1,900 @@
+/*
+ * OS/2026 Web Emulator — Mobile-Friendly Edition
+ * VGA 80×25 faithful emulation + IndexedDB FS
+ * Mobile: real textarea input + virtual CLI keyboard + D-pad
+ */
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─── IndexedDB FS ───────────────────────────────────────
+const DB_NAME="OS2026_FS",DB_VER=1,STORE="fs";
+function openDB(){
+  return new Promise((res,rej)=>{
+    const r=indexedDB.open(DB_NAME,DB_VER);
+    r.onupgradeneeded=e=>{
+      const db=e.target.result;
+      if(!db.objectStoreNames.contains(STORE))
+        db.createObjectStore(STORE,{keyPath:"path"});
+    };
+    r.onsuccess=e=>res(e.target.result);
+    r.onerror=()=>rej(r.error);
+  });
+}
+const txs=(db,m)=>db.transaction(STORE,m).objectStore(STORE);
+const dbGet=(db,p)=>new Promise((r,j)=>{const q=txs(db,"readonly").get(p);q.onsuccess=()=>r(q.result);q.onerror=()=>j(q.error);});
+const dbPut=(db,rec)=>new Promise((r,j)=>{const q=txs(db,"readwrite").put(rec);q.onsuccess=()=>r();q.onerror=()=>j(q.error);});
+const dbDel=(db,p)=>new Promise((r,j)=>{const q=txs(db,"readwrite").delete(p);q.onsuccess=()=>r();q.onerror=()=>j(q.error);});
+const dbAll=(db)=>new Promise((r,j)=>{const q=txs(db,"readonly").getAll();q.onsuccess=()=>r(q.result);q.onerror=()=>j(q.error);});
+
+class FS{
+  constructor(db){this.db=db;}
+  _p(dir,n){return dir==="/"?`/${n}`:`${dir}/${n}`;}
+  async ls(dir){
+    const all=await dbAll(this.db);
+    const pre=dir==="/"?"/":dir+"/";
+    return all.filter(r=>{
+      if(r.path===dir)return false;
+      if(!r.path.startsWith(pre))return false;
+      return !r.path.slice(pre.length).includes("/");
+    }).map(r=>({name:r.path.slice(pre.length),isDir:r.isDir,size:r.content?.length??0}));
+  }
+  async mkdir(dir,n){
+    const p=this._p(dir,n);
+    if(await dbGet(this.db,p))throw new Error(`'${n}' already exists`);
+    await dbPut(this.db,{path:p,isDir:true,content:null});
+  }
+  async writeFile(dir,n,c){await dbPut(this.db,{path:this._p(dir,n),isDir:false,content:c});}
+  async readFile(dir,n){
+    const r=await dbGet(this.db,this._p(dir,n));
+    if(!r)throw new Error("no file");
+    if(r.isDir)throw new Error("is dir");
+    return r.content??"";
+  }
+  async rm(dir,n){
+    const p=this._p(dir,n);const r=await dbGet(this.db,p);
+    if(!r)throw new Error("no such file");
+    if(r.isDir)throw new Error("not a file");
+    await dbDel(this.db,p);
+  }
+  async rmdir(dir,n){
+    const p=this._p(dir,n);const r=await dbGet(this.db,p);
+    if(!r)throw new Error("no such dir");
+    if(!r.isDir)throw new Error("not a directory");
+    if((await this.ls(p)).length)throw new Error("not empty");
+    await dbDel(this.db,p);
+  }
+  async mv(dir,s,d){
+    const sp=this._p(dir,s);const r=await dbGet(this.db,sp);
+    if(!r)throw new Error("no such file");
+    await dbPut(this.db,{...r,path:this._p(dir,d)});
+    await dbDel(this.db,sp);
+  }
+  async cp(dir,s,d){
+    const sp=this._p(dir,s);const r=await dbGet(this.db,sp);
+    if(!r)throw new Error("no such file");
+    if(r.isDir)throw new Error("dir copy unsupported");
+    await dbPut(this.db,{...r,path:this._p(dir,d)});
+  }
+  async cd(dir,n){
+    const p=this._p(dir,n);const r=await dbGet(this.db,p);
+    if(!r||!r.isDir)throw new Error("not dir");
+    return p;
+  }
+}
+
+// ─── VGA ────────────────────────────────────────────────
+const COLS=80,ROWS=25;
+const VGA_PAL=[
+  "#000000","#0000AA","#00AA00","#00AAAA",
+  "#AA0000","#AA00AA","#AA5500","#AAAAAA",
+  "#555555","#5555FF","#55FF55","#55FFFF",
+  "#FF5555","#FF55FF","#FFFF55","#FFFFFF",
+];
+const NC={
+  DESK:0x05,DESK_ALT:0x0D,
+  WIN_BODY:0x17,WIN_TITLE:0x5F,WIN_TITLEX:0x58,
+  WIN_BORDER:0x5B,WIN_CLOSE:0xC0,
+  SEL:0xF0,DIR:0x1B,FILE:0x17,
+  TASKBAR:0x50,TASK_START:0xF5,TASK_WIN:0x5F,TASK_WINX:0x58,
+  HINT:0x0B,
+  MENU_BG:0x50,MENU_SEL:0xF0,MENU_HEAD:0x5F,MENU_SEP:0x58,
+};
+function aFgBg(a){return{fg:a&0x0F,bg:(a>>4)&0x0F};}
+function mkBuf(){return Array.from({length:ROWS*COLS},()=>({ch:' ',fg:7,bg:0}));}
+
+class VGA{
+  constructor(){this.buf=mkBuf();this.row=0;this.col=0;}
+  putch(r,c,ch,attr){
+    if(r<0||r>=ROWS||c<0||c>=COLS)return;
+    const{fg,bg}=aFgBg(attr);
+    this.buf[r*COLS+c]={ch,fg,bg};
+  }
+  puts(r,c,s,attr){for(let i=0;i<s.length&&c+i<COLS;i++)this.putch(r,c+i,s[i],attr);}
+  fill(r,c0,c1,ch,attr){for(let c=c0;c<=c1;c++)this.putch(r,c,ch,attr);}
+  fillrect(r0,c0,r1,c1,ch,attr){for(let r=r0;r<=r1;r++)this.fill(r,c0,c1,ch,attr);}
+  box(r0,c0,r1,c1,attr,fa){
+    this.putch(r0,c0,'+',attr);this.putch(r0,c1,'+',attr);
+    this.putch(r1,c0,'+',attr);this.putch(r1,c1,'+',attr);
+    for(let c=c0+1;c<c1;c++){this.putch(r0,c,'-',attr);this.putch(r1,c,'-',attr);}
+    for(let r=r0+1;r<r1;r++){this.putch(r,c0,'|',attr);this.putch(r,c1,'|',attr);}
+    for(let r=r0+1;r<r1;r++)this.fill(r,c0+1,c1-1,' ',fa);
+  }
+  scroll(){
+    for(let r=1;r<ROWS;r++)for(let c=0;c<COLS;c++)this.buf[(r-1)*COLS+c]={...this.buf[r*COLS+c]};
+    this.fill(ROWS-1,0,COLS-1,' ',0x17);this.row=ROWS-1;
+  }
+  emit(ch){
+    if(ch==='\n'){this.row++;this.col=0;}
+    else if(ch==='\b'){if(this.col>0){this.col--;this.putch(this.row,this.col,' ',0x17);}}
+    else{this.putch(this.row,this.col,ch,0x17);if(++this.col===COLS){this.col=0;this.row++;}}
+    if(this.row>=ROWS)this.scroll();
+  }
+}
+
+// ─── CLI buf ─────────────────────────────────────────────
+function buildCLI(lines,inp){
+  const vga=new VGA();
+  vga.fillrect(0,0,ROWS-1,COLS-1,' ',0x17);
+  let row=0,col=0;
+  const emit=(s,attr)=>{
+    for(const ch of s){
+      if(ch==='\n'){row++;col=0;if(row>=ROWS)row=ROWS-1;}
+      else{if(row<ROWS&&col<COLS)vga.putch(row,col,ch,attr??0x17);col++;if(col>=COLS){col=0;row++;}}
+    }
+  };
+  for(const l of lines)emit(l.text+'\n',l.attr??0x17);
+  emit('OS/2026> ',0x17);
+  emit(inp,0x1F);
+  return{buf:vga.buf,cr:Math.min(row,ROWS-1),cc:Math.min(col,COLS-1)};
+}
+
+// ─── GUI buf ─────────────────────────────────────────────
+const WIN_FILES=1,WIN_TERM=2,WIN_INFO=3,MAX_WINS=3;
+const SMENU_LABELS=[
+  " [1] File Explorer  ",
+  " [2] Terminal       ",
+  " [3] System Info    ",
+  " ---------------    ",
+  " [R] Reboot  [H] Off",
+];
+
+function buildGUI(state,feEnt){
+  const vga=new VGA();
+  for(let r=0;r<ROWS-2;r++)vga.fill(r,0,COLS-1,'.',(r&1)?NC.DESK:NC.DESK_ALT);
+  vga.puts(10,28,"* OS/2026 NEON DESKTOP *",0x0D);
+  vga.puts(11,30,"~ neon // dark theme ~",0x05);
+
+  for(let wid=0;wid<MAX_WINS;wid++){
+    const w=state.wins[wid];if(!w.open)continue;
+    const focused=state.focus===wid;
+    const ba=focused?NC.WIN_BORDER:0x18,ta=focused?NC.WIN_TITLE:NC.WIN_TITLEX;
+    vga.box(w.r0,w.c0,w.r0+w.rows-1,w.c0+w.cols-1,ba,NC.WIN_BODY);
+    vga.fill(w.r0,w.c0+1,w.c0+w.cols-2,' ',ta);
+    const ttls=["","[ File Explorer ]","[ Terminal ]","[ System Info ]"];
+    const ttl=ttls[w.type]||"";
+    vga.puts(w.r0,w.c0+Math.floor((w.cols-ttl.length)/2),ttl,ta);
+    vga.putch(w.r0,w.c0+w.cols-2,'X',NC.WIN_CLOSE);
+
+    if(w.type===WIN_INFO){
+      const cr=w.r0+1,cc=w.c0+1,ic=w.cols-2;
+      vga.fillrect(cr,cc,cr+w.rows-2,cc+ic-1,' ',NC.WIN_BODY);
+      vga.puts(cr,cc,"  OS/2026  System Information",NC.WIN_TITLE);
+      vga.fill(cr+1,cc,cc+ic-1,'=',NC.WIN_BORDER);
+      vga.puts(cr+2,cc,"  Kernel : OS/2026 v3.0 neon",NC.FILE);
+      vga.puts(cr+3,cc,"  Arch   : i386 (32-bit x86)",NC.FILE);
+      vga.puts(cr+4,cc,"  FS     : 2025FS (IndexedDB)",NC.FILE);
+      vga.puts(cr+5,cc,"  VGA    : 80x25 text mode",NC.FILE);
+      vga.puts(cr+6,cc,"  Tasks  : cooperative multitask",NC.FILE);
+      vga.puts(cr+7,cc,"  IME    : 2-beolsik Hangul",NC.DIR);
+      vga.fill(cr+8,cc,cc+ic-1,'-',NC.WIN_BORDER);
+      vga.puts(cr+9,cc,"  Dev    : kdy010010 & team",0x0D);
+    }
+    if(w.type===WIN_TERM){
+      const cr=w.r0+1,cc=w.c0+1,ic=w.cols-2;
+      vga.fillrect(cr,cc,cr+w.rows-2,cc+ic-1,' ',NC.WIN_BODY);
+      vga.puts(cr,cc,"OS/2026 Mini-Terminal",NC.WIN_TITLE);
+      vga.puts(cr+1,cc,"Type cmd, Enter=run, ESC=close",NC.DIR);
+      vga.fill(cr+2,cc,cc+ic-1,'-',NC.WIN_BORDER);
+      vga.puts(cr+3,cc,"> ",NC.FILE);
+      const tb=w.tm_buf||"";
+      vga.puts(cr+3,cc+2,tb,NC.SEL);
+      vga.putch(cr+3,cc+2+tb.length,'_',NC.WIN_TITLE);
+      const out=w.tm_out||[];
+      for(let i=0;i<out.length&&i<w.rows-6;i++){
+        vga.puts(cr+w.rows-3-i,cc,out[out.length-1-i].slice(0,ic),NC.WIN_BODY);
+      }
+    }
+    if(w.type===WIN_FILES){
+      const cr=w.r0+1,cc=w.c0+1,ic=w.cols-2,ir=w.rows-2;
+      const pw=Math.floor(ic/2)-1,sepc=cc+pw;
+      for(let r=cr;r<cr+ir;r++)vga.putch(r,sepc,'|',NC.WIN_BORDER);
+      const pc=[cc,sepc+1],pw2=[pw,ic-pw-1];
+      for(let p=0;p<2;p++){
+        const active=w.fe_panel===p;
+        const ha=active?NC.WIN_TITLE:NC.WIN_TITLEX;
+        vga.fill(cr,pc[p],pc[p]+pw2[p]-1,' ',ha);
+        const dn=(w.fe_dir_name?.[p]||"/").slice(-Math.min((w.fe_dir_name?.[p]||"/").length,pw2[p]-4));
+        vga.puts(cr,pc[p],`[${dn}]`,ha);
+        vga.puts(cr,pc[p]+pw2[p]-2,p?"R":"L",ha);
+        vga.fill(cr+1,pc[p],pc[p]+pw2[p]-1,'-',NC.WIN_BORDER);
+        const visible=ir-3,ents=feEnt[p]||[];
+        for(let row=0;row<visible;row++){
+          const vr=cr+2+row;
+          vga.fill(vr,pc[p],pc[p]+pw2[p]-1,' ',NC.WIN_BODY);
+          const idx=w.fe_top[p]+row;if(idx>=ents.length)continue;
+          const en=ents[idx];
+          const ea=(active&&idx===w.fe_sel[p])?NC.SEL:en.isDir?NC.DIR:NC.FILE;
+          const nw=pw2[p]-7;
+          vga.puts(vr,pc[p],(en.name.slice(0,nw).padEnd(nw,' '))+' '+(en.isDir?"<DIR>":String(en.size).padStart(5,' ')),ea);
+        }
+      }
+    }
+  }
+
+  if(state.startOpen){
+    const SH=7,SR=ROWS-2-SH,SW=22;
+    vga.box(SR,0,SR+SH-1,SW-1,NC.MENU_HEAD,NC.MENU_BG);
+    vga.puts(SR,1,"  ** START MENU **   ",NC.MENU_HEAD);
+    for(let i=0;i<5;i++){
+      let a=(i===state.startSel)?NC.MENU_SEL:NC.MENU_BG;
+      if(i===3)a=NC.MENU_SEP;
+      vga.fill(SR+1+i,1,SW-2,' ',a);
+      vga.puts(SR+1+i,1,SMENU_LABELS[i],a);
+    }
+  }
+
+  vga.fill(23,0,COLS-1,' ',NC.TASKBAR);
+  vga.puts(23,0," [>] START",NC.TASK_START);
+  let cx=11;
+  const wnames=[" [File] "," [Term] "," [Info] "];
+  for(let i=0;i<MAX_WINS;i++){
+    if(!state.wins[i].open)continue;
+    vga.puts(23,cx,wnames[i],(state.focus===i)?NC.TASK_WIN:NC.TASK_WINX);
+    cx+=9;
+  }
+  if(state.status&&cx+2+state.status.length<71)vga.puts(23,cx+2,state.status,NC.TASK_WINX);
+  const now=new Date();
+  vga.puts(23,72,`[${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}]`,NC.TASK_WINX);
+
+  vga.fill(24,0,COLS-1,' ',NC.HINT);
+  const hint=state.startOpen?"UP/DOWN=select ENTER=open ESC=close"
+    :state.focus>=0?"ESC=close Tab=panel Enter=open Del=del S=start"
+    :"S=start F1=Files F2=Term F3=Info ESC=exit";
+  vga.puts(24,0,hint,NC.HINT);
+  return vga.buf;
+}
+
+// ─── Canvas component ────────────────────────────────────
+const CW=9,CH=17;
+function VGACanvas({buf,cr,cc,blink}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    const canvas=ref.current;if(!canvas)return;
+    const ctx=canvas.getContext("2d");
+    ctx.font=`bold ${CH-2}px "Courier New",monospace`;
+    ctx.textBaseline="top";
+    for(let r=0;r<ROWS;r++){
+      for(let c=0;c<COLS;c++){
+        let{ch,fg,bg}=buf[r*COLS+c];
+        const isCur=blink&&r===cr&&c===cc;
+        if(isCur){const t=fg;fg=bg;bg=t;}
+        ctx.fillStyle=VGA_PAL[bg];ctx.fillRect(c*CW,r*CH,CW,CH);
+        if(ch&&ch!==' '){ctx.fillStyle=VGA_PAL[fg];ctx.fillText(ch,c*CW,r*CH+1);}
+      }
+    }
+  },[buf,cr,cc,blink]);
+  return <canvas ref={ref} width={COLS*CW} height={ROWS*CH} style={{display:'block',maxWidth:'100%'}}/>;
+}
+
+// ─── Boot ────────────────────────────────────────────────
+const BOOT_LINES=`boot success
+========================================
+   OS/2026 v3.1 NEON  (red horse build)
+   Developed by kdy010010
+   Type 'devs' for contributors
+========================================
+
+Type 'help' for commands.
+Type 'gui'  to launch the NEON Desktop.
+Hangul: Ctrl+Space toggle.
+Mouse: PS/2 (GUI only).
+
+`.split('\n');
+
+// ─── App ─────────────────────────────────────────────────
+export default function App(){
+  const [fs,setFs]=useState(null);
+  const [phase,setPhase]=useState("boot");
+  const [cliLines,setCliLines]=useState([]);
+  const [input,setInput]=useState("");
+  const [curDir,setCurDir]=useState("/");
+  const [hist,setHist]=useState([]);
+  const [histIdx,setHistIdx]=useState(-1);
+  const [guiSt,setGuiSt]=useState(null);
+  const [feEnt,setFeEnt]=useState([[],[]]);
+  const [blink,setBlink]=useState(true);
+  // mobile: show virtual keyboard panel
+  const [showVK,setShowVK]=useState(false);
+
+  const fsRef=useRef(null);
+  const curDirRef=useRef("/");
+  const guiRef=useRef(null);
+  const feRef=useRef([[],[]]);
+  // The real textarea used for mobile input
+  const taRef=useRef(null);
+  const guiTaRef=useRef(null);
+  // track previous textarea value for diff
+  const prevValRef=useRef("");
+  const guiPrevValRef=useRef("");
+
+  useEffect(()=>{fsRef.current=fs;},[fs]);
+  useEffect(()=>{curDirRef.current=curDir;},[curDir]);
+  useEffect(()=>{guiRef.current=guiSt;},[guiSt]);
+  useEffect(()=>{feRef.current=feEnt;},[feEnt]);
+
+  // cursor blink
+  useEffect(()=>{const t=setInterval(()=>setBlink(v=>!v),530);return()=>clearInterval(t);},[]);
+
+  // clock tick gui
+  useEffect(()=>{
+    if(phase!=="gui")return;
+    const t=setInterval(()=>setGuiSt(g=>g?{...g}:g),30000);
+    return()=>clearInterval(t);
+  },[phase]);
+
+  // DB init
+  useEffect(()=>{
+    openDB().then(async db=>{
+      const inst=new FS(db);
+      if(!await dbGet(db,"/")){
+        await dbPut(db,{path:"/",isDir:true,content:null});
+        await dbPut(db,{path:"/readme.txt",isDir:false,content:"Welcome to OS/2026!\nDeveloped by kdy010010.\nType 'help' for commands."});
+        await dbPut(db,{path:"/docs",isDir:true,content:null});
+        await dbPut(db,{path:"/docs/info.txt",isDir:false,content:"OS/2026 v3.1 NEON\nFS: 2025FS (IndexedDB)\nDev: kdy010010 & team"});
+      }
+      setFs(inst);
+    });
+  },[]);
+
+  // boot animation
+  const booting=useRef(false);
+  useEffect(()=>{
+    if(!fs||booting.current)return;
+    booting.current=true;
+    let i=0;
+    const next=()=>{
+      if(i>=BOOT_LINES.length){setPhase("cli");return;}
+      setCliLines(p=>[...p,{text:BOOT_LINES[i],attr:0x17}]);
+      i++;setTimeout(next,i<6?100:25);
+    };
+    setTimeout(next,300);
+  },[fs]);
+
+  // focus textarea when phase changes
+  useEffect(()=>{
+    if(phase==="cli"){
+      prevValRef.current="";
+      setTimeout(()=>taRef.current?.focus(),100);
+    }
+  },[phase]);
+
+  const out=useCallback((text,attr=0x17)=>{
+    setCliLines(p=>[...p,...text.split('\n').map(t=>({text:t,attr}))]);
+  },[]);
+
+  // ── CLI cmd ──────────────────────────────────────────
+  const runCmd=useCallback(async(raw)=>{
+    if(!raw.trim())return;
+    out(`OS/2026> ${raw}`);
+    setHist(h=>[raw,...h.slice(0,49)]);
+    setHistIdx(-1);
+    const f=fsRef.current,d=curDirRef.current;
+    const parts=raw.trim().split(/\s+/),c=parts[0];
+    try{
+      if(c==="help")
+        out("help ls cd <d> mkdir <d> cat <f> write <f> <text>\nappend <f> <text> rm <f> rmdir <d> mv <s> <d>\ncp <s> <d> root pwd clear reboot devs gui");
+      else if(c==="devs")
+        out("\n  OS/2025 Contributors:\n  ----------------------\n  - kdy010010  (Lead developer)\n  - modemaker\n  - tajo1243\n  - JK\n");
+      else if(c==="reboot"){
+        setCliLines([]);booting.current=false;
+        const saved=fsRef.current;setFs(null);
+        setTimeout(()=>setFs(saved),50);
+      }
+      else if(c==="clear")setCliLines([]);
+      else if(c==="pwd")out(d);
+      else if(c==="root"){setCurDir("/");out("/");}
+      else if(c==="gui"){
+        const dw=()=>({open:false,type:0,r0:1,c0:0,rows:10,cols:40,
+          fe_panel:0,fe_dir:[d,"/"],fe_dir_name:[d.split("/").pop()||"/","/"],
+          fe_sel:[0,0],fe_top:[0,0],tm_buf:"",tm_out:[]});
+        setGuiSt({wins:[dw(),dw(),dw()],focus:-1,startOpen:false,startSel:0,status:"Ready"});
+        setPhase("gui");
+        return;
+      }
+      else if(c==="ls"){
+        const es=await f.ls(d);
+        if(!es.length)out("(empty)");
+        else[...es.filter(e=>e.isDir),...es.filter(e=>!e.isDir)]
+          .forEach(e=>out(`  ${e.isDir?"<DIR>":"     "} ${e.name}${e.isDir?"/":"  "+e.size+"B"}`));
+      }
+      else if(c==="cd"){
+        if(!parts[1]){out("usage: cd <dir>");return;}
+        if(parts[1]===".."){
+          if(d!=="/"){const p=d.split("/").filter(Boolean);p.pop();setCurDir(p.length?"/"+p.join("/"):"/")}
+        }else setCurDir(await f.cd(d,parts[1]));
+      }
+      else if(c==="mkdir"){if(!parts[1]){out("usage: mkdir <n>");return;}await f.mkdir(d,parts[1]);out("directory created");}
+      else if(c==="rm"){if(!parts[1]){out("usage: rm <file>");return;}await f.rm(d,parts[1]);out("file deleted");}
+      else if(c==="rmdir"){if(!parts[1]){out("usage: rmdir <dir>");return;}await f.rmdir(d,parts[1]);out("directory removed");}
+      else if(c==="cat"){if(!parts[1]){out("usage: cat <file>");return;}out(await f.readFile(d,parts[1]));}
+      else if(c==="write"){if(!parts[1]){out("usage: write <file> <text>");return;}await f.writeFile(d,parts[1],parts.slice(2).join(" "));out("written");}
+      else if(c==="append"){
+        if(!parts[1]){out("usage: append <file> <text>");return;}
+        let ex="";try{ex=await f.readFile(d,parts[1]);}catch(_){}
+        await f.writeFile(d,parts[1],ex+(ex?"\n":"")+parts.slice(2).join(" "));out("appended");
+      }
+      else if(c==="mv"){if(!parts[1]||!parts[2]){out("usage: mv <src> <dst>");return;}await f.mv(d,parts[1],parts[2]);out("moved");}
+      else if(c==="cp"){if(!parts[1]||!parts[2]){out("usage: cp <src> <dst>");return;}await f.cp(d,parts[1],parts[2]);out("copied");}
+      else out("?");
+    }catch(e){out(String(e.message).trim());}
+  },[out]);
+
+  // ── GUI helpers ──────────────────────────────────────
+  const guiOpenWin=useCallback((s,wid,type)=>{
+    const w={...s.wins[wid]};
+    w.open=true;w.type=type;
+    if(type===WIN_FILES){
+      w.rows=20;w.cols=76;w.r0=1;w.c0=2;
+      w.fe_panel=0;w.fe_dir=[curDirRef.current,"/"];
+      w.fe_dir_name=[curDirRef.current.split("/").pop()||"/","/"];
+      w.fe_sel=[0,0];w.fe_top=[0,0];
+      setTimeout(async()=>{
+        const f=fsRef.current;
+        const r0=await f.ls(curDirRef.current).catch(()=>[]);
+        const r1=await f.ls("/").catch(()=>[]);
+        setFeEnt([[...r0.filter(e=>e.isDir),...r0.filter(e=>!e.isDir)],[...r1.filter(e=>e.isDir),...r1.filter(e=>!e.isDir)]]);
+      },0);
+    }
+    if(type===WIN_TERM){w.rows=14;w.cols=60;w.r0=4;w.c0=10;w.tm_buf="";w.tm_out=[];}
+    if(type===WIN_INFO){w.rows=12;w.cols=44;w.r0=5;w.c0=18;}
+    const wins=[...s.wins];wins[wid]=w;
+    return{...s,wins,focus:wid};
+  },[]);
+
+  const guiClose=(s,wid)=>{
+    const wins=s.wins.map((w,i)=>i===wid?{...w,open:false}:w);
+    let focus=-1;for(let i=MAX_WINS-1;i>=0;i--)if(wins[i].open){focus=i;break;}
+    return{...s,wins,focus};
+  };
+
+  const reloadFe=useCallback(async(wid,p,dir)=>{
+    const f=fsRef.current;
+    const es=await f.ls(dir).catch(()=>[]);
+    const sorted=[...es.filter(e=>e.isDir),...es.filter(e=>!e.isDir)];
+    setFeEnt(prev=>{const n=[...prev];n[p]=sorted;return n;});
+  },[]);
+
+  // ── GUI key handler ──────────────────────────────────
+  const guiKey=useCallback((key)=>{
+    setGuiSt(prev=>{
+      if(!prev)return prev;
+      let s={...prev,wins:prev.wins.map(w=>({...w,fe_sel:[...w.fe_sel],fe_top:[...w.fe_top]}))};
+
+      if(s.startOpen){
+        if(key==="Escape"){s.startOpen=false;return s;}
+        if(key==="ArrowUp"){s.startSel=s.startSel>0?s.startSel-1:0;if(s.startSel===3)s.startSel=2;return s;}
+        if(key==="ArrowDown"){s.startSel=s.startSel<4?s.startSel+1:4;if(s.startSel===3)s.startSel=4;return s;}
+        if(key==="Enter"){
+          s.startOpen=false;
+          if(s.startSel===0)s=guiOpenWin(s,0,WIN_FILES);
+          else if(s.startSel===1)s=guiOpenWin(s,1,WIN_TERM);
+          else if(s.startSel===2)s=guiOpenWin(s,2,WIN_INFO);
+          else if(s.startSel===4)setTimeout(()=>{setPhase("cli");out("Returned to CLI.");},0);
+          return s;
+        }
+        return s;
+      }
+
+      if(key==="Escape"){
+        if(s.focus>=0)return guiClose(s,s.focus);
+        setTimeout(()=>{setPhase("cli");out("Returned to CLI.");},0);
+        return s;
+      }
+      if(key==="s"||key==="S"){s.startOpen=true;s.startSel=0;return s;}
+      if(key==="F1")return guiOpenWin(s,0,WIN_FILES);
+      if(key==="F2")return guiOpenWin(s,1,WIN_TERM);
+      if(key==="F3")return guiOpenWin(s,2,WIN_INFO);
+
+      if(s.focus<0)return s;
+      const wid=s.focus,w=s.wins[wid];
+
+      if(w.type===WIN_FILES){
+        const p=w.fe_panel,visible=w.rows-5,cnt=feRef.current[p]?.length??0;
+        if(key==="ArrowUp"){if(w.fe_sel[p]>0){w.fe_sel[p]--;if(w.fe_sel[p]<w.fe_top[p])w.fe_top[p]--;}}
+        else if(key==="ArrowDown"){if(w.fe_sel[p]<cnt-1){w.fe_sel[p]++;if(w.fe_sel[p]>=w.fe_top[p]+visible)w.fe_top[p]++;}}
+        else if(key==="Tab"){w.fe_panel^=1;}
+        else if(key==="Enter"){
+          const en=feRef.current[p]?.[w.fe_sel[p]];
+          if(en?.isDir){
+            const nd=w.fe_dir[p]==="/"?`/${en.name}`:`${w.fe_dir[p]}/${en.name}`;
+            const _wid=wid,_p=p;
+            s.wins[wid]=w;
+            setTimeout(async()=>{
+              await reloadFe(_wid,_p,nd);
+              setGuiSt(g=>{
+                if(!g)return g;
+                const ww={...g.wins[_wid]};
+                ww.fe_dir=[...ww.fe_dir];ww.fe_dir[_p]=nd;
+                ww.fe_dir_name=[...ww.fe_dir_name];ww.fe_dir_name[_p]=nd.split("/").pop()||"/";
+                ww.fe_sel=[...ww.fe_sel];ww.fe_sel[_p]=0;
+                ww.fe_top=[...ww.fe_top];ww.fe_top[_p]=0;
+                const nw=[...g.wins];nw[_wid]=ww;return{...g,wins:nw};
+              });
+            },0);
+          }
+        }
+        else if(key==="Delete"){
+          const en=feRef.current[p]?.[w.fe_sel[p]];
+          if(en){
+            const _wid=wid,_p=p,_dir=w.fe_dir[p];
+            setTimeout(async()=>{
+              try{
+                if(en.isDir)await fsRef.current.rmdir(_dir,en.name);
+                else await fsRef.current.rm(_dir,en.name);
+                await reloadFe(_wid,_p,_dir);
+              }catch(_){}
+            },0);
+          }
+        }
+        s.wins[wid]=w;
+      }
+
+      if(w.type===WIN_TERM){
+        if(key==="Escape")return guiClose(s,wid);
+        if(key==="Backspace"){w.tm_buf=(w.tm_buf||"").slice(0,-1);}
+        else if(key==="Enter"){
+          const cmd=w.tm_buf.trim();
+          w.tm_out=[...(w.tm_out||[]),`> ${cmd}`];
+          w.tm_buf="";
+          setTimeout(async()=>{
+            const f=fsRef.current,d=curDirRef.current;
+            let res="";
+            try{
+              const pts=cmd.split(/\s+/),c2=pts[0];
+              if(c2==="ls"){const es=await f.ls(d);res=es.length?[...es.filter(e=>e.isDir),...es.filter(e=>!e.isDir)].map(e=>`${e.isDir?"<DIR>":"     "} ${e.name}`).join("\n"):"(empty)";}
+              else if(c2==="mkdir"&&pts[1]){await f.mkdir(d,pts[1]);res="directory created";}
+              else if(c2==="rm"&&pts[1]){await f.rm(d,pts[1]);res="file deleted";}
+              else if(c2==="cat"&&pts[1]){res=await f.readFile(d,pts[1]);}
+              else if(c2==="write"&&pts[1]){await f.writeFile(d,pts[1],pts.slice(2).join(" "));res="written";}
+              else if(c2==="pwd"){res=d;}
+              else if(c2==="help"){res="ls mkdir rm cat write pwd";}
+              else res="?";
+            }catch(e){res="ERR: "+e.message.trim();}
+            setGuiSt(g=>{
+              if(!g)return g;
+              const ww={...g.wins[wid]};
+              ww.tm_out=[...(ww.tm_out||[]),...res.split("\n")];
+              if(ww.tm_out.length>8)ww.tm_out=ww.tm_out.slice(-8);
+              const nw=[...g.wins];nw[wid]=ww;return{...g,wins:nw};
+            });
+          },0);
+        }
+        else if(key.length===1){if((w.tm_buf||"").length<50)w.tm_buf=(w.tm_buf||"")+key;}
+        s.wins[wid]=w;
+      }
+      return s;
+    });
+  },[guiOpenWin,reloadFe,out]);
+
+  // ── Canvas click ─────────────────────────────────────
+  const onCanvasClick=useCallback((e)=>{
+    if(phase!=="gui")return;
+    const rect=e.currentTarget.getBoundingClientRect();
+    const sx=e.currentTarget.width/rect.width,sy=e.currentTarget.height/rect.height;
+    const col=Math.floor((e.clientX-rect.left)*sx/CW);
+    const row=Math.floor((e.clientY-rect.top)*sy/CH);
+    const s=guiRef.current;if(!s)return;
+
+    if(row===23){
+      if(col<10){setGuiSt(g=>g?{...g,startOpen:!g.startOpen,startSel:0}:g);return;}
+      let cx=11;
+      for(let i=0;i<MAX_WINS;i++){
+        if(!s.wins[i].open)continue;
+        if(col>=cx&&col<cx+8){setGuiSt(g=>g?{...g,focus:i}:g);return;}
+        cx+=9;
+      }
+    }
+    if(s.startOpen){
+      const SH=7,SR=ROWS-2-SH;
+      if(row>=SR&&row<SR+SH&&col>=0&&col<22){
+        const item=row-SR-1;
+        if(item>=0&&item<5&&item!==3){
+          setGuiSt(g=>{
+            if(!g)return g;
+            let ns={...g,startOpen:false,startSel:item};
+            if(item===0)ns=guiOpenWin(ns,0,WIN_FILES);
+            else if(item===1)ns=guiOpenWin(ns,1,WIN_TERM);
+            else if(item===2)ns=guiOpenWin(ns,2,WIN_INFO);
+            else if(item===4)setTimeout(()=>{setPhase("cli");out("Returned to CLI.");},0);
+            return ns;
+          });return;
+        }
+      }
+    }
+    for(let wid=0;wid<MAX_WINS;wid++){
+      const w=s.wins[wid];if(!w.open)continue;
+      if(row===w.r0&&col===w.c0+w.cols-2){setGuiSt(g=>g?guiClose(g,wid):g);return;}
+      if(row===w.r0&&col>=w.c0&&col<w.c0+w.cols){setGuiSt(g=>g?{...g,focus:wid}:g);
+        if(w.type===WIN_TERM)setTimeout(()=>guiTaRef.current?.focus(),50);
+        return;
+      }
+      if(w.type===WIN_FILES&&row>w.r0&&row<w.r0+w.rows&&col>w.c0&&col<w.c0+w.cols){
+        const ic=w.cols-2,pw=Math.floor(ic/2)-1,sepc=w.c0+1+pw;
+        const p=col>sepc?1:0,entRow=row-(w.r0+3);
+        if(entRow>=0){
+          const idx=w.fe_top[p]+entRow;
+          if(idx<(feRef.current[p]||[]).length){
+            setGuiSt(g=>{
+              if(!g)return g;
+              const ww={...g.wins[wid]};
+              ww.fe_panel=p;ww.fe_sel=[...ww.fe_sel];ww.fe_sel[p]=idx;
+              const nw=[...g.wins];nw[wid]=ww;return{...g,wins:nw,focus:wid};
+            });
+          }
+        }return;
+      }
+    }
+  },[phase,guiOpenWin,out]);
+
+  // ── Desktop keydown (for hw keyboard) ────────────────
+  const onKeyDown=useCallback((e)=>{
+    if(phase==="gui"){
+      guiKey(e.key);
+      if(["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Tab","Enter","F1","F2","F3","Escape"].includes(e.key))
+        e.preventDefault();
+    }
+  },[phase,guiKey]);
+
+  // ── Textarea input handling (CLI) ─────────────────────
+  // We use a real textarea for mobile keyboard compatibility.
+  // Strategy: compare new value to old to extract typed chars / deletions.
+  const onTaKeyDown=useCallback((e)=>{
+    if(e.key==="Enter"){
+      e.preventDefault();
+      runCmd(input);
+      setInput("");
+      prevValRef.current="";
+      if(taRef.current)taRef.current.value="";
+    }else if(e.key==="ArrowUp"){
+      e.preventDefault();
+      setHistIdx(i=>{const ni=Math.min(i+1,hist.length-1);const v=hist[ni]||"";setInput(v);if(taRef.current){taRef.current.value=v;prevValRef.current=v;}return ni;});
+    }else if(e.key==="ArrowDown"){
+      e.preventDefault();
+      setHistIdx(i=>{const ni=Math.max(i-1,-1);const v=ni<0?"":hist[ni]||"";setInput(v);if(taRef.current){taRef.current.value=v;prevValRef.current=v;}return ni;});
+    }
+  },[input,hist,runCmd]);
+
+  const onTaInput=useCallback((e)=>{
+    // get current value, filter out newlines (Enter handled via keydown)
+    const newVal=e.target.value.replace(/\n/g,"");
+    e.target.value=newVal;
+    prevValRef.current=newVal;
+    setInput(newVal);
+  },[]);
+
+  // ── GUI terminal textarea ─────────────────────────────
+  const onGuiTaKeyDown=useCallback((e)=>{
+    const wid=guiRef.current?.focus;
+    if(wid==null||wid<0)return;
+    if(e.key==="Enter"){e.preventDefault();guiKey("Enter");if(guiTaRef.current){guiTaRef.current.value="";guiPrevValRef.current="";}}
+    else if(e.key==="Backspace"){e.preventDefault();guiKey("Backspace");}
+    else if(e.key==="Escape"){e.preventDefault();guiKey("Escape");}
+  },[guiKey]);
+
+  const onGuiTaInput=useCallback((e)=>{
+    const wid=guiRef.current?.focus;
+    if(wid==null||wid<0)return;
+    const w=guiRef.current?.wins[wid];
+    if(!w||w.type!==WIN_TERM)return;
+    const newVal=e.target.value.replace(/\n/g,"");
+    const prev=guiPrevValRef.current;
+    // find appended chars
+    if(newVal.length>prev.length){
+      const added=newVal.slice(prev.length);
+      for(const ch of added)guiKey(ch);
+    }else if(newVal.length<prev.length){
+      guiKey("Backspace");
+    }
+    guiPrevValRef.current=newVal;
+    e.target.value=newVal;
+  },[guiKey]);
+
+  // ── D-pad + GUI controls ─────────────────────────────
+  const focusedWinType=guiSt?.focus>=0?guiSt?.wins[guiSt.focus]?.type:null;
+
+  // ── Render ───────────────────────────────────────────
+  const cliBufData=buildCLI(cliLines,input);
+  const guiBufData=guiSt?buildGUI(guiSt,feEnt):null;
+  const dispBuf=(phase==="gui"&&guiBufData)?guiBufData:cliBufData.buf;
+  const dispCr=(phase==="gui")?ROWS-1:cliBufData.cr;
+  const dispCc=(phase==="gui")?0:cliBufData.cc;
+
+  // common button style
+  const btnS=(extra={})=>({
+    background:"#1c1c1c",border:"1px solid #444",color:"#ccc",
+    cursor:"pointer",borderRadius:3,fontFamily:"monospace",
+    display:"flex",alignItems:"center",justifyContent:"center",
+    WebkitTapHighlightColor:"transparent",
+    userSelect:"none",...extra
+  });
+
+  // CLI quick-command bar
+  const CLI_SHORTCUTS=[
+    ["ls"],["pwd"],["help"],["devs"],["gui"],
+    ["cd .."],["clear"],["reboot"],
+  ];
+
+  return(
+    <div
+      tabIndex={0}
+      onKeyDown={onKeyDown}
+      style={{outline:"none",background:"#000",width:"100vw",height:"100vh",
+        display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-start",
+        overflow:"hidden",userSelect:"none",boxSizing:"border-box"}}
+    >
+      {/* VGA canvas — scrollable horizontally on mobile */}
+      <div style={{overflowX:"auto",overflowY:"hidden",width:"100%",flexShrink:0,
+        WebkitOverflowScrolling:"touch"}}>
+        <div style={{display:"inline-block",position:"relative"}}>
+          <div onClick={phase==="gui"?onCanvasClick:undefined} style={{cursor:phase==="gui"?"default":"text"}}>
+            <VGACanvas buf={dispBuf} cr={dispCr} cc={dispCc} blink={blink}/>
+          </div>
+
+          {/* CLI textarea — real, visible-ish at bottom so mobile keyboard works */}
+          {phase==="cli"&&(
+            <textarea
+              ref={taRef}
+              rows={1}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              onKeyDown={onTaKeyDown}
+              onInput={onTaInput}
+              style={{
+                position:"absolute",left:0,bottom:0,
+                width:"100%",height:2,
+                opacity:0.01,resize:"none",
+                background:"transparent",border:"none",
+                color:"transparent",caretColor:"transparent",
+                fontSize:16,outline:"none",
+                zIndex:10,overflow:"hidden",
+              }}
+            />
+          )}
+
+          {/* GUI terminal textarea */}
+          {phase==="gui"&&focusedWinType===WIN_TERM&&(
+            <textarea
+              ref={guiTaRef}
+              rows={1}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              onKeyDown={onGuiTaKeyDown}
+              onInput={onGuiTaInput}
+              style={{
+                position:"absolute",left:0,bottom:0,
+                width:"100%",height:2,
+                opacity:0.01,resize:"none",
+                background:"transparent",border:"none",
+                color:"transparent",caretColor:"transparent",
+                fontSize:16,outline:"none",
+                zIndex:10,overflow:"hidden",
+              }}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* ── CLI bottom panel ── */}
+      {phase==="cli"&&(
+        <div style={{width:"100%",flexShrink:0,background:"#111",borderTop:"1px solid #333",
+          display:"flex",flexDirection:"column",gap:0}}>
+
+          {/* input row */}
+          <div style={{display:"flex",alignItems:"center",padding:"4px 6px",gap:6,background:"#0a0a0a"}}>
+            <span style={{color:"#aaa",fontSize:12,flexShrink:0,fontFamily:"monospace"}}>
+              {curDir}&gt;
+            </span>
+            {/* tap-to-focus button that shows current input */}
+            <div
+              style={{flex:1,background:"#1a1a1a",border:"1px solid #333",borderRadius:3,
+                padding:"4px 8px",fontFamily:"monospace",fontSize:13,color:"#55ff55",
+                minHeight:26,cursor:"text",wordBreak:"break-all"}}
+              onClick={()=>taRef.current?.focus()}
+            >
+              {input||<span style={{color:"#444"}}>tap to type…</span>}
+            </div>
+            {/* backspace */}
+            <button style={btnS({width:36,height:32,fontSize:16})}
+              onPointerDown={e=>{e.preventDefault();setInput(v=>v.slice(0,-1));}}>⌫</button>
+            {/* enter */}
+            <button style={btnS({width:44,height:32,fontSize:12,background:"#002200",borderColor:"#0a0"})}
+              onPointerDown={e=>{e.preventDefault();runCmd(input);setInput("");if(taRef.current){taRef.current.value="";prevValRef.current="";};}}>↵</button>
+          </div>
+
+          {/* shortcut bar */}
+          <div style={{display:"flex",overflowX:"auto",gap:4,padding:"4px 6px",
+            WebkitOverflowScrolling:"touch",flexShrink:0}}>
+            {CLI_SHORTCUTS.map(([cmd])=>(
+              <button key={cmd}
+                style={btnS({padding:"4px 10px",fontSize:11,whiteSpace:"nowrap",flexShrink:0})}
+                onPointerDown={e=>{e.preventDefault();runCmd(cmd);}}>
+                {cmd}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── GUI bottom panel (D-pad + actions) ── */}
+      {phase==="gui"&&(
+        <div style={{width:"100%",flexShrink:0,background:"#111",borderTop:"1px solid #333",
+          padding:"6px 8px",display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+
+          {/* D-pad */}
+          <div style={{display:"grid",gridTemplateColumns:"36px 36px 36px",gridTemplateRows:"36px 36px 36px",gap:2}}>
+            <div/>
+            <button style={btnS({fontSize:16})} onPointerDown={e=>{e.preventDefault();guiKey("ArrowUp");}}>▲</button>
+            <div/>
+            <button style={btnS({fontSize:16})} onPointerDown={e=>{e.preventDefault();guiKey("ArrowLeft");}}>◀</button>
+            <button style={btnS({fontSize:14})} onPointerDown={e=>{e.preventDefault();guiKey("Enter");}}>↵</button>
+            <button style={btnS({fontSize:16})} onPointerDown={e=>{e.preventDefault();guiKey("ArrowRight");}}>▶</button>
+            <div/>
+            <button style={btnS({fontSize:16})} onPointerDown={e=>{e.preventDefault();guiKey("ArrowDown");}}>▼</button>
+            <div/>
+          </div>
+
+          {/* action buttons */}
+          <div style={{display:"flex",flexDirection:"column",gap:4}}>
+            <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+              <button style={btnS({padding:"4px 10px",fontSize:11})}
+                onPointerDown={e=>{e.preventDefault();guiKey("Tab");}}>Tab</button>
+              <button style={btnS({padding:"4px 10px",fontSize:11})}
+                onPointerDown={e=>{e.preventDefault();guiKey("Delete");}}>Del</button>
+              <button style={btnS({padding:"4px 10px",fontSize:11})}
+                onPointerDown={e=>{e.preventDefault();guiKey("Escape");}}>ESC</button>
+            </div>
+            <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+              <button style={btnS({padding:"4px 10px",fontSize:11,background:"#1a0030",borderColor:"#a0a"})}
+                onPointerDown={e=>{e.preventDefault();guiKey("s");}}>START</button>
+              <button style={btnS({padding:"4px 10px",fontSize:11})}
+                onPointerDown={e=>{e.preventDefault();guiKey("F1");}}>F1 Files</button>
+              <button style={btnS({padding:"4px 10px",fontSize:11})}
+                onPointerDown={e=>{e.preventDefault();guiKey("F2");}}>F2 Term</button>
+              <button style={btnS({padding:"4px 10px",fontSize:11})}
+                onPointerDown={e=>{e.preventDefault();guiKey("F3");}}>F3 Info</button>
+            </div>
+          </div>
+
+          {/* GUI terminal text input row */}
+          {focusedWinType===WIN_TERM&&(
+            <div style={{width:"100%",display:"flex",gap:6,alignItems:"center",marginTop:2}}>
+              <div style={{flex:1,background:"#1a1a1a",border:"1px solid #333",borderRadius:3,
+                padding:"4px 8px",fontFamily:"monospace",fontSize:12,color:"#55ff55",
+                minHeight:24,cursor:"text"}}
+                onClick={()=>guiTaRef.current?.focus()}>
+                {guiSt?.wins[guiSt.focus]?.tm_buf||<span style={{color:"#444"}}>tap to type…</span>}
+              </div>
+              <button style={btnS({width:36,height:30,fontSize:15})}
+                onPointerDown={e=>{e.preventDefault();guiKey("Backspace");}}>⌫</button>
+              <button style={btnS({width:44,height:30,fontSize:12,background:"#002200",borderColor:"#0a0"})}
+                onPointerDown={e=>{e.preventDefault();guiKey("Enter");if(guiTaRef.current){guiTaRef.current.value="";guiPrevValRef.current="";}}}>↵</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
